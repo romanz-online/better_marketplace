@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Marketplace Lens",
+  "name": "Better Marketplace",
   "version": "1.0.0",
   "description": "Personal browsing aid for Facebook Marketplace. Surfaces where your search is targeting vs. where results actually come from, read from Facebook's own intercepted data layer (no scraping). To show how far each result is, it sends result city names (not your data) to a geocoding service.",
 

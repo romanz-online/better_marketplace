@@ -1,4 +1,4 @@
-# Marketplace Lens
+# Better Marketplace
 
 A **personal, client-side** Chrome (Manifest V3) extension that overlays a small
 custom panel on Facebook Marketplace. It shows, live as you scroll:
@@ -37,7 +37,7 @@ This is for personal use only.
 2. Toggle **Developer mode** (top-right) on.
 3. Click **Load unpacked**.
 4. Select this folder (`marketplace-lens`).
-5. Go to `https://www.facebook.com/marketplace/…` — the **Marketplace Lens**
+5. Go to `https://www.facebook.com/marketplace/…` — the **Better Marketplace**
    card appears in the top-right corner.
 
 To pick up code changes: edit the files, then hit the **↻ reload** icon on the
@@ -63,7 +63,7 @@ enough, it may stop finding listings. When that happens:
 
 - The panel shows a clear orange notice:
   *"Couldn't read listing data — Facebook may have changed format…"*
-- The DevTools **console** logs (prefixed `[Marketplace Lens]`) either how many
+- The DevTools **console** logs (prefixed `[Better Marketplace]`) either how many
   listings were found, or a loud "found NO listing nodes" message **with the
   raw response object** so you can inspect it.
 
@@ -145,7 +145,7 @@ that the content script verifies).
 3. **Searching in** reflects your current search/location.
 4. Scroll — **Results arriving from** populates with locations + counts and
    updates live.
-5. Open the DevTools **console** — confirm `[Marketplace Lens]` logs show
+5. Open the DevTools **console** — confirm `[Better Marketplace]` logs show
    listings found (or a clear "found nothing" log telling you to patch
    `extractListings`).
 6. Confirm Marketplace itself still behaves normally (responses pass through

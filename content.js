@@ -1,5 +1,5 @@
 /* ============================================================================
- * Marketplace Lens — content.js  (runs in the ISOLATED content-script world)
+ * Better Marketplace — content.js  (runs in the ISOLATED content-script world)
  * ----------------------------------------------------------------------------
  * Owns ALL UI and state. Receives normalized listing data from hook.js via
  * window.postMessage and renders the corner panel:
@@ -17,7 +17,7 @@
   if (window.__ML_CONTENT_INSTALLED__) return;
   window.__ML_CONTENT_INSTALLED__ = true;
 
-  const TAG = "[Marketplace Lens]";
+  const TAG = "[Better Marketplace]";
   const MSG_TYPE = "ML_LISTINGS";
 
   /* ==========================================================================
@@ -25,7 +25,7 @@
    * settings later (loaded/saved via chrome.storage.local).
    * ========================================================================*/
   const CONFIG = {
-    panelTitle: "Marketplace Lens",
+    panelTitle: "Better Marketplace",
     startCollapsed: false,
     maxLocationsShown: 50, // cap the rendered location list for sanity
     // How many messages with zero listings (while we DO have a search context)

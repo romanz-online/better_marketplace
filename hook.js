@@ -1,5 +1,5 @@
 /* ============================================================================
- * Marketplace Lens — hook.js  (runs in the PAGE'S MAIN WORLD)
+ * Better Marketplace — hook.js  (runs in the PAGE'S MAIN WORLD)
  * ----------------------------------------------------------------------------
  * This file is injected into Facebook's own JavaScript context (manifest:
  * "world": "MAIN") so it can observe the real window.fetch / XMLHttpRequest
@@ -27,7 +27,7 @@
   if (window.__ML_HOOK_INSTALLED__) return;
   window.__ML_HOOK_INSTALLED__ = true;
 
-  const TAG = "[Marketplace Lens]";
+  const TAG = "[Better Marketplace]";
   const MSG_TYPE = "ML_LISTINGS";
 
   // DIAGNOSTIC: when true, log ONE raw listing node + the request variables the

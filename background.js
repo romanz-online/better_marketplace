@@ -1,5 +1,5 @@
 /* ============================================================================
- * Marketplace Lens — background.js  (MV3 service worker)
+ * Better Marketplace — background.js  (MV3 service worker)
  * ----------------------------------------------------------------------------
  * Sole job: turn a city name (e.g. "Gardner, Massachusetts") into coordinates
  * so content.js can compute the distance from the search center.
