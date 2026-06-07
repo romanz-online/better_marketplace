@@ -140,6 +140,55 @@
   font-weight: 500;
 }
 
+/* ----- Radius control ----- */
+.ml-radius-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ml-radius-input {
+  appearance: none;
+  -moz-appearance: textfield;
+  width: 64px;
+  padding: 4px 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #1c1e21;
+  background: #ffffff;
+  border: 1px solid #d4d7dd;
+  border-radius: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.ml-radius-input:focus {
+  outline: none;
+  border-color: #1877f2;
+  box-shadow: 0 0 0 2px rgba(24, 119, 242, 0.18);
+}
+.ml-radius-unit {
+  font-size: 12px;
+  font-weight: 600;
+  color: #5a5e66;
+}
+.ml-radius-hint {
+  font-size: 11px;
+  color: #0b3d91;
+  font-weight: 600;
+}
+.ml-radius-hint.ml-muted {
+  color: #8a8d94;
+  font-weight: 500;
+}
+
+/* "N hidden (out of radius)" note. */
+.ml-filtered-note {
+  font-size: 11px;
+  font-weight: 600;
+  color: #8a3a00;
+}
+.ml-filtered-note:empty {
+  display: none;
+}
+
 /* Subtle divider between the two sections. */
 .ml-section--results {
   border-top: 1px solid #eceef1;

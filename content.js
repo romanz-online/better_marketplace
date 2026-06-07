@@ -32,14 +32,64 @@
     // before we show the "couldn't read data" degraded notice.
     emptyResponsesBeforeWarning: 8,
 
-    // STUB: add future user-configurable parameters here, e.g.
-    //   distanceRadiusKm, keywordBlocklist, hideAlreadySeen, sortMode, ...
+    // User's true search radius in MILES (the FB UI value, e.g. "within 10
+    // miles"). null = filtering OFF (everything passes through). Persisted.
+    radiusMiles: null,
+    // Buffer added to the radius to account for FB's intentional location
+    // obfuscation. Kept in km to match the hook's distance math.
+    bufferKm: 5,
   };
 
-  // STUB: persistence. v1 keeps everything in memory.
-  //   loadConfig(): read overrides from chrome.storage.local into CONFIG.
-  //   saveConfig(): persist CONFIG (e.g. collapsed state) to chrome.storage.local.
-  // chrome.storage.local.get(...) / .set(...) — wire up when settings UI lands.
+  const MILES_TO_KM = 1.60934;
+  const STORAGE_KEY = "mlConfig";
+
+  // Persistence: settings live in chrome.storage.local under STORAGE_KEY.
+  function loadConfig(done) {
+    try {
+      chrome.storage.local.get(STORAGE_KEY, (obj) => {
+        if (!chrome.runtime.lastError && obj && obj[STORAGE_KEY]) {
+          const saved = obj[STORAGE_KEY];
+          if (saved.radiusMiles != null && Number.isFinite(Number(saved.radiusMiles))) {
+            CONFIG.radiusMiles = Number(saved.radiusMiles);
+          }
+        }
+        if (typeof done === "function") done();
+      });
+    } catch {
+      if (typeof done === "function") done();
+    }
+  }
+
+  function saveConfig() {
+    try {
+      chrome.storage.local.set({
+        [STORAGE_KEY]: { radiusMiles: CONFIG.radiusMiles },
+      });
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  // Push the active filtering config to hook.js (MAIN world). radiusKm null =
+  // filtering off. Called on init and whenever the radius changes, and in reply
+  // to the hook's ML_CONFIG_REQ (it may have loaded before us).
+  function pushConfigToPage() {
+    try {
+      const radiusKm =
+        CONFIG.radiusMiles != null ? CONFIG.radiusMiles * MILES_TO_KM : null;
+      window.postMessage(
+        {
+          __marketplaceLens: true,
+          type: "ML_CONFIG",
+          radiusKm,
+          bufferKm: CONFIG.bufferKm,
+        },
+        window.location.origin
+      );
+    } catch {
+      /* ignore */
+    }
+  }
 
   /* ==========================================================================
    * STATE
@@ -54,6 +104,7 @@
     collapsed: CONFIG.startCollapsed,
     emptyResponseStreak: 0, // consecutive messages with 0 listings
     sawAnyListing: false,
+    filteredTotal: 0, // listings hidden from packets (out of radius), running sum
   };
 
   /* ==========================================================================
@@ -121,6 +172,46 @@
       console.warn(TAG, "geocode request failed (ignored):", err);
     }
   }
+
+  /* ==========================================================================
+   * BRIDGE for hook.js (MAIN world) — it can't call chrome.runtime, so it asks
+   * us to (a) relay city→coords geocode requests to the background worker, and
+   * (b) hand it the current filtering config. Only same-window, namespaced
+   * messages are trusted.
+   * ========================================================================*/
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    const data = event.data;
+    if (!data || data.__marketplaceLens !== true) return;
+
+    if (data.type === "ML_GEOCODE_REQ") {
+      const reqId = data.reqId;
+      const reply = (ok, lat, lng) => {
+        try {
+          window.postMessage(
+            { __marketplaceLens: true, type: "ML_GEOCODE_RES", reqId, ok, lat, lng },
+            window.location.origin
+          );
+        } catch {
+          /* ignore */
+        }
+      };
+      try {
+        chrome.runtime.sendMessage({ type: "ML_GEOCODE", q: data.q }, (resp) => {
+          if (chrome.runtime.lastError || !resp || resp.lat == null || resp.lng == null) {
+            reply(false);
+          } else {
+            reply(true, resp.lat, resp.lng);
+          }
+        });
+      } catch {
+        reply(false);
+      }
+    } else if (data.type === "ML_CONFIG_REQ") {
+      // Hook started up and wants the current config.
+      pushConfigToPage();
+    }
+  });
 
   // STUB: setupDomObserver()
   // This is the clearly-labeled place where, later, we will match filtered
@@ -195,6 +286,10 @@
         state.searchContext = data.searchContext;
       }
 
+      if (typeof data.filteredCount === "number" && data.filteredCount > 0) {
+        state.filteredTotal += data.filteredCount;
+      }
+
       const added = ingestListings(data.listings);
 
       // Track empty-response streaks to drive the degraded-mode notice.
@@ -254,6 +349,41 @@
       '<div class="ml-section-label">Searching in</div>' +
       '<div class="ml-search-value"></div>';
 
+    // Section: Radius control — the user's TRUE radius (FB's packet radius is
+    // unreliable). Empty = filtering off. Drives packet-level filtering in hook.js.
+    const radiusSection = document.createElement("section");
+    radiusSection.className = "ml-section ml-section--radius";
+    radiusSection.innerHTML =
+      '<div class="ml-section-label">Show within</div>' +
+      '<div class="ml-radius-row">' +
+      '<input class="ml-radius-input" type="number" min="0" step="1" ' +
+      'inputmode="decimal" placeholder="off" /> ' +
+      '<span class="ml-radius-unit">miles</span>' +
+      "</div>" +
+      '<div class="ml-radius-hint"></div>';
+
+    const radiusInput = radiusSection.querySelector(".ml-radius-input");
+    if (CONFIG.radiusMiles != null) radiusInput.value = String(CONFIG.radiusMiles);
+
+    const onRadiusChange = () => {
+      const v = radiusInput.value.trim();
+      if (v === "" || Number(v) <= 0 || !Number.isFinite(Number(v))) {
+        CONFIG.radiusMiles = null; // off
+      } else {
+        CONFIG.radiusMiles = Number(v);
+      }
+      saveConfig();
+      pushConfigToPage();
+      render();
+    };
+    radiusInput.addEventListener("change", onRadiusChange);
+    radiusInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        radiusInput.blur();
+      }
+    });
+
     // Section: Results arriving from
     const resultsSection = document.createElement("section");
     resultsSection.className = "ml-section ml-section--results";
@@ -261,10 +391,12 @@
       '<div class="ml-section-label">Results arriving from' +
       ' <span class="ml-total-badge"></span></div>' +
       '<div class="ml-dist-summary"></div>' +
+      '<div class="ml-filtered-note"></div>' +
       '<ul class="ml-loc-list"></ul>' +
       '<div class="ml-empty"></div>';
 
     body.appendChild(searchSection);
+    body.appendChild(radiusSection);
     body.appendChild(resultsSection);
 
     root.appendChild(header);
@@ -275,8 +407,11 @@
       root,
       toggle,
       searchValue: searchSection.querySelector(".ml-search-value"),
+      radiusInput,
+      radiusHint: radiusSection.querySelector(".ml-radius-hint"),
       totalBadge: resultsSection.querySelector(".ml-total-badge"),
       distSummary: resultsSection.querySelector(".ml-dist-summary"),
+      filteredNote: resultsSection.querySelector(".ml-filtered-note"),
       locList: resultsSection.querySelector(".ml-loc-list"),
       empty: resultsSection.querySelector(".ml-empty"),
     };
@@ -445,11 +580,32 @@
     }
   }
 
+  // Render the radius hint + the "N hidden" note from current state.
+  function renderFilterStatus() {
+    if (CONFIG.radiusMiles != null) {
+      const km = Math.round(CONFIG.radiusMiles * MILES_TO_KM);
+      els.radiusHint.textContent = `filtering · +${CONFIG.bufferKm} km buffer (~${km} km)`;
+      els.radiusHint.classList.remove("ml-muted");
+    } else {
+      els.radiusHint.textContent = "off — set a radius to hide far listings";
+      els.radiusHint.classList.add("ml-muted");
+    }
+
+    if (state.filteredTotal > 0) {
+      els.filteredNote.style.display = "block";
+      els.filteredNote.textContent = `${state.filteredTotal} hidden (out of radius)`;
+    } else {
+      els.filteredNote.style.display = "none";
+      els.filteredNote.textContent = "";
+    }
+  }
+
   function render() {
     if (!els) return;
     els.root.setAttribute("data-ml-collapsed", String(state.collapsed));
     els.toggle.textContent = state.collapsed ? "+" : "–";
     renderSearchContext();
+    renderFilterStatus();
     renderResults();
   }
 
@@ -462,10 +618,15 @@
       window.addEventListener("DOMContentLoaded", init, { once: true });
       return;
     }
-    buildPanel();
-    render();
-    setupDomObserver(); // no-op observer (stub) in v1
-    console.debug(TAG, "content.js UI ready.");
+    // Load persisted settings BEFORE building the panel so the radius input is
+    // pre-filled, then push the config to the hook (MAIN world).
+    loadConfig(() => {
+      buildPanel();
+      render();
+      pushConfigToPage();
+      setupDomObserver(); // no-op observer (stub) in v1
+      console.debug(TAG, "content.js UI ready.");
+    });
   }
 
   init();

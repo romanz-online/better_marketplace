@@ -6,13 +6,17 @@
  * calls Facebook uses to load Marketplace listings from its GraphQL endpoint.
  *
  * GOLDEN RULES (do not break these):
- *   1. PASSIVE ONLY. We observe. We pass every response back to Facebook
- *      completely untouched. We never block, delay meaningfully, or rewrite.
+ *   1. FAIL OPEN. We may now REWRITE Marketplace GraphQL responses to drop
+ *      out-of-radius listings before Facebook parses them — but ONLY when we
+ *      are confident. On any doubt (no radius set, no search center, geocode
+ *      timeout, parse/rewrite error) we return the ORIGINAL response untouched.
+ *      Facebook must keep working as if we weren't here.
  *   2. NEVER THROW INTO THE PAGE. Every bit of our own parsing is wrapped in
- *      try/catch. If our code fails, Facebook must keep working as if we
- *      weren't here.
+ *      try/catch. If our code fails, the original response is returned.
  *   3. CLIENT-SIDE ONLY. We only postMessage extracted data to our own
  *      content script (same window, same origin). Nothing is sent anywhere.
+ *      The single exception is geocode REQUESTS we relay through content.js to
+ *      our background worker (city name → coordinates); no listing data leaves.
  *
  * The single most fragile thing here is extractListings(): Facebook's GraphQL
  * response shape is obfuscated and changes over time. It is written
@@ -30,11 +34,28 @@
   const TAG = "[Better Marketplace]";
   const MSG_TYPE = "ML_LISTINGS";
 
+  /* --------------------------------------------------------------------------
+   * FILTERING CONFIG (pushed from content.js, our ISOLATED-world sibling).
+   * Until content.js sends an ML_CONFIG message, filtering stays OFF and every
+   * response passes through untouched (fail-open). currentRadiusKm == null
+   * means "no radius set" → no filtering.
+   * ------------------------------------------------------------------------*/
+  let currentRadiusKm = null; // user's true radius (km); null = filtering off
+  let currentBufferKm = 5; // obfuscation buffer (km)
+
+  // Overall budget for a single response's geocoding + rewrite. If we blow it,
+  // we fail open and return the original body, so a stalled geocoder can never
+  // freeze Facebook's loading.
+  const FILTER_TIMEOUT_MS = 8000;
+  // Per-city geocode timeout. On expiry the city is treated as "unknown" and
+  // its listings are KEPT (fail-open per-listing).
+  const GEOCODE_TIMEOUT_MS = 4000;
+
   // DIAGNOSTIC: when true, log ONE raw listing node + the request variables the
   // first time we extract listings. Use this to discover the current Facebook
   // GraphQL shape (where lat/lng + city live), then set the field paths in
   // normalizeListing()/extractSearchContext() and flip this back to false.
-  const ML_DEBUG = false;
+  const ML_DEBUG = true;
   let ml_debugDumped = false;
 
   /* --------------------------------------------------------------------------
@@ -56,6 +77,99 @@
       // Swallow — must never disrupt the page.
       console.warn(TAG, "postMessage failed", err);
     }
+  }
+
+  /* ==========================================================================
+   * GEOCODING BRIDGE (MAIN world side)
+   * --------------------------------------------------------------------------
+   * We run in the page's MAIN world and CANNOT call chrome.runtime, so we can't
+   * reach the background geocoder directly. Instead we postMessage a request to
+   * content.js (ISOLATED world), which relays it to the background worker and
+   * posts the answer back. Each unique city is requested at most once per page
+   * (in-memory cache); content.js + background add persistent caching on top.
+   * ========================================================================*/
+  const cityCoordsCache = new Map(); // normalizedCity -> {lat,lng} | null
+  const pendingGeocodes = new Map(); // reqId -> { resolve, timer }
+  let geocodeReqSeq = 0;
+
+  function normalizeCityKey(name) {
+    return String(name || "").trim().toLowerCase();
+  }
+
+  // Resolve a city name to {lat,lng} or null (unknown). Never rejects.
+  function geocodeCity(name) {
+    const key = normalizeCityKey(name);
+    if (!key) return Promise.resolve(null);
+    if (cityCoordsCache.has(key)) return Promise.resolve(cityCoordsCache.get(key));
+
+    return new Promise((resolve) => {
+      const reqId = "g" + ++geocodeReqSeq;
+      const timer = setTimeout(() => {
+        // Timed out — treat as unknown, keep the listing (fail-open).
+        if (pendingGeocodes.has(reqId)) {
+          pendingGeocodes.delete(reqId);
+          resolve(null);
+        }
+      }, GEOCODE_TIMEOUT_MS);
+      pendingGeocodes.set(reqId, {
+        resolve: (coords) => {
+          clearTimeout(timer);
+          cityCoordsCache.set(key, coords); // cache positive AND null results
+          resolve(coords);
+        },
+      });
+      postMessageOut({ type: "ML_GEOCODE_REQ", reqId, q: name });
+    });
+  }
+
+  // Listen for replies + config pushed from content.js (same window/origin).
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    const data = event.data;
+    if (!data || data.__marketplaceLens !== true) return;
+
+    if (data.type === "ML_GEOCODE_RES") {
+      const entry = pendingGeocodes.get(data.reqId);
+      if (!entry) return; // unknown/expired reqId
+      pendingGeocodes.delete(data.reqId);
+      const coords =
+        data.ok && data.lat != null && data.lng != null
+          ? { lat: Number(data.lat), lng: Number(data.lng) }
+          : null;
+      entry.resolve(coords);
+    } else if (data.type === "ML_CONFIG") {
+      // radiusKm null/undefined => filtering off.
+      currentRadiusKm =
+        data.radiusKm != null && Number.isFinite(Number(data.radiusKm))
+          ? Number(data.radiusKm)
+          : null;
+      if (data.bufferKm != null && Number.isFinite(Number(data.bufferKm))) {
+        currentBufferKm = Number(data.bufferKm);
+      }
+      console.debug(
+        TAG,
+        "config updated → radiusKm:",
+        currentRadiusKm,
+        "bufferKm:",
+        currentBufferKm
+      );
+    }
+  });
+
+  // Ask content.js for the current config on startup (it may have loaded before
+  // us, or after — content.js also pushes config on its own init).
+  postMessageOut({ type: "ML_CONFIG_REQ" });
+
+  // Great-circle distance between two lat/lng points, in kilometres (Haversine).
+  function haversineKm(lat1, lng1, lat2, lng2) {
+    const R = 6371; // Earth mean radius (km)
+    const toRad = (d) => (d * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLng = toRad(lng2 - lng1);
+    const a =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
   }
 
   /* --------------------------------------------------------------------------
@@ -456,27 +570,17 @@
     return url.includes("/api/graphql") || url.includes("graphql");
   }
 
-  // Shared: given a response body + the request URL + (optional) request vars,
-  // parse, extract, and emit. Wrapped so callers never see an exception.
-  function handleResponseBody(bodyText, url, requestVars) {
+  // Emit extracted listings (+ how many we hid) to the panel. The single place
+  // an ML_LISTINGS message is sent. `filteredCount` is the number removed from
+  // the response body before Facebook saw it (0 in observe-only mode).
+  function emitToPanel(allListings, url, requestVars, filteredCount, searchCtx) {
     try {
-      const docs = parseMaybeNDJSON(bodyText);
-      let allListings = [];
-      for (const doc of docs) {
-        const listings = extractListings(doc);
-        if (listings.length) allListings = allListings.concat(listings);
-      }
-
       // DIAGNOSTIC: dump one raw listing node + the request vars exactly once,
       // so the real location field paths can be confirmed. See ML_DEBUG above.
       if (ML_DEBUG && !ml_debugDumped && allListings.length) {
         ml_debugDumped = true;
         try {
-          console.log(
-            TAG,
-            "ML_DEBUG sample raw listing node →",
-            allListings[0].raw
-          );
+          console.log(TAG, "ML_DEBUG sample raw listing node →", allListings[0].raw);
           console.log(TAG, "ML_DEBUG request variables →", requestVars);
           console.log(
             TAG,
@@ -488,21 +592,224 @@
         }
       }
 
-      const searchContext = extractSearchContext(
-        window.location.href,
-        requestVars
-      );
+      const searchContext =
+        searchCtx || extractSearchContext(window.location.href, requestVars);
 
       // Always emit search context (cheap) so the panel can show "Searching in"
-      // even before any listings arrive. Only emit listings when we have some.
+      // even before any listings arrive.
       postMessageOut({
         listings: allListings,
         searchContext,
         source: url,
+        filteredCount: filteredCount || 0,
       });
+    } catch (err) {
+      console.warn(TAG, "emitToPanel error (ignored):", err);
+    }
+  }
+
+  // Shared OBSERVE-ONLY path: parse, extract, emit. Used when filtering is off
+  // and for XHR traffic (which we don't rewrite). Never throws.
+  function handleResponseBody(bodyText, url, requestVars) {
+    try {
+      const docs = parseMaybeNDJSON(bodyText);
+      let allListings = [];
+      for (const doc of docs) {
+        const listings = extractListings(doc);
+        if (listings.length) allListings = allListings.concat(listings);
+      }
+      emitToPanel(allListings, url, requestVars, 0);
     } catch (err) {
       console.warn(TAG, "handleResponseBody error (ignored):", err);
     }
+  }
+
+  /* ==========================================================================
+   * ACTIVE FILTERING
+   * --------------------------------------------------------------------------
+   * splitBody / rebuildBody preserve the response's line structure so we can
+   * rewrite NDJSON streams without losing lines we couldn't parse (those are
+   * kept verbatim). For a single-JSON body there is exactly one segment.
+   * ========================================================================*/
+  function splitBody(text) {
+    // Fast path: the whole body is one JSON document.
+    try {
+      const doc = JSON.parse(text);
+      return [{ doc, raw: text, single: true }];
+    } catch {
+      /* fall through to NDJSON */
+    }
+    const segs = [];
+    for (const line of text.split("\n")) {
+      if (!line.trim()) {
+        segs.push({ doc: null, raw: line }); // blank/whitespace line — keep as-is
+        continue;
+      }
+      let doc = null;
+      try {
+        doc = JSON.parse(line);
+      } catch {
+        /* unparseable line — keep verbatim */
+      }
+      segs.push({ doc, raw: line });
+    }
+    return segs;
+  }
+
+  function rebuildBody(segs) {
+    if (segs.length === 1 && segs[0].single) {
+      return JSON.stringify(segs[0].doc);
+    }
+    return segs
+      .map((s) => (s.doc != null ? JSON.stringify(s.doc) : s.raw))
+      .join("\n");
+  }
+
+  // Remove dropped listing nodes from a parsed tree, in place. Mirrors
+  // collectListings' walk. For every ARRAY we encounter, drop any element that
+  // IS a dropped node or that wraps one as its `.node` (FB's edges shape:
+  // edges: [{ node: <listing wrapper>, cursor }]).
+  function pruneTree(root, dropSet) {
+    const seen = new Set();
+    const MAX_DEPTH = 40;
+    function walk(node, depth) {
+      if (depth > MAX_DEPTH || node === null || typeof node !== "object") return;
+      if (seen.has(node)) return;
+      seen.add(node);
+      if (Array.isArray(node)) {
+        for (let i = node.length - 1; i >= 0; i--) {
+          const el = node[i];
+          const wraps =
+            el && typeof el === "object" && !Array.isArray(el) && dropSet.has(el.node);
+          if (dropSet.has(el) || wraps) {
+            node.splice(i, 1);
+            continue;
+          }
+          walk(el, depth + 1);
+        }
+        return;
+      }
+      for (const key in node) {
+        if (key === "__marketplaceLens") continue;
+        try {
+          walk(node[key], depth + 1);
+        } catch {
+          /* throwing getter — skip */
+        }
+      }
+    }
+    walk(root, 0);
+  }
+
+  // Filter listings beyond radius+buffer out of a response body.
+  // Returns the rewritten body string, or null to mean "leave the original
+  // response untouched" (fail-open, or nothing needed removing).
+  async function filterBody(text, url, requestVars) {
+    const searchContext = extractSearchContext(window.location.href, requestVars);
+    const centerLat = searchContext.latitude;
+    const centerLng = searchContext.longitude;
+    const haveCenter =
+      centerLat != null &&
+      centerLng != null &&
+      Number.isFinite(centerLat) &&
+      Number.isFinite(centerLng);
+
+    const segs = splitBody(text);
+
+    // Collect raw listing nodes (for identity-based pruning) across all docs.
+    const rawNodes = [];
+    for (const seg of segs) {
+      if (seg.doc != null) {
+        for (const node of collectListings(seg.doc)) rawNodes.push(node);
+      }
+    }
+
+    // No center or no listings → can't/needn't filter. Still feed the panel.
+    if (!haveCenter || rawNodes.length === 0) {
+      emitToPanel(rawNodes.map(normalizeListing), url, requestVars, 0, searchContext);
+      return null;
+    }
+
+    const normalized = rawNodes.map((n) => ({ node: n, info: normalizeListing(n) }));
+
+    // Geocode unique cities (THE intentional delay). Cached cities are instant.
+    const cities = new Set();
+    for (const { info } of normalized) {
+      if (info.locationName) cities.add(info.locationName);
+    }
+    const cityList = Array.from(cities);
+    const coordsList = await Promise.all(cityList.map((c) => geocodeCity(c)));
+    const cityCoords = new Map();
+    cityList.forEach((c, i) => cityCoords.set(c, coordsList[i]));
+
+    // Decide keep/drop. Unknown distance → keep (fail-open per listing).
+    const limit = currentRadiusKm + currentBufferKm;
+    const dropSet = new Set();
+    const kept = [];
+    for (const { node, info } of normalized) {
+      let lat = info.latitude;
+      let lng = info.longitude;
+      if ((lat == null || !Number.isFinite(lat)) && info.locationName) {
+        const c = cityCoords.get(info.locationName);
+        if (c) {
+          lat = c.lat;
+          lng = c.lng;
+        }
+      }
+      if (lat == null || lng == null || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+        kept.push(info);
+        continue;
+      }
+      const dist = haversineKm(centerLat, centerLng, lat, lng);
+      if (dist > limit) dropSet.add(node);
+      else kept.push(info);
+    }
+
+    const filteredCount = dropSet.size;
+    if (ML_DEBUG) {
+      console.debug(
+        TAG,
+        `filter: center (${centerLat}, ${centerLng}), limit ${limit} km →`,
+        `${kept.length} kept, ${filteredCount} dropped of ${normalized.length}.`
+      );
+    }
+
+    // Tell the panel what survived + how many we hid.
+    emitToPanel(kept, url, requestVars, filteredCount, searchContext);
+
+    if (filteredCount === 0) return null; // nothing removed → leave body as-is
+    for (const seg of segs) if (seg.doc != null) pruneTree(seg.doc, dropSet);
+    return rebuildBody(segs);
+  }
+
+  // Resolve `promise` but give up after `ms`, resolving to `fallback` instead.
+  // Used so a stalled geocode can never freeze Facebook's response.
+  function withTimeout(promise, ms, fallback) {
+    return new Promise((resolve) => {
+      let done = false;
+      const t = setTimeout(() => {
+        if (!done) {
+          done = true;
+          resolve(fallback);
+        }
+      }, ms);
+      promise.then(
+        (v) => {
+          if (!done) {
+            done = true;
+            clearTimeout(t);
+            resolve(v);
+          }
+        },
+        () => {
+          if (!done) {
+            done = true;
+            clearTimeout(t);
+            resolve(fallback);
+          }
+        }
+      );
+    });
   }
 
   // Try to pull GraphQL variables out of a request body (form-encoded "variables"
@@ -527,45 +834,67 @@
   }
 
   /* ==========================================================================
-   * HOOK 1: window.fetch
+   * HOOK 1: window.fetch  (the PRIMARY filtering path)
+   * --------------------------------------------------------------------------
+   * We await the real response, and — when filtering is on — rewrite its body
+   * to drop out-of-radius listings before Facebook parses it. On ANY doubt we
+   * return the ORIGINAL response untouched (fail-open).
    * ========================================================================*/
   const originalFetch = window.fetch;
   if (typeof originalFetch === "function") {
-    window.fetch = function (...args) {
-      // Call the REAL fetch immediately and return its promise to the caller.
-      const promise = originalFetch.apply(this, args);
+    window.fetch = async function (...args) {
+      // Always issue the real request and keep its response as our fallback.
+      const response = await originalFetch.apply(this, args);
 
-      // Observe without altering: clone the resolved response and read the
-      // clone's body, so Facebook still consumes the original stream normally.
-      promise
-        .then((response) => {
-          try {
-            const url =
-              (response && response.url) ||
-              (typeof args[0] === "string" ? args[0] : args[0]?.url) ||
-              "";
-            if (!isInterestingUrl(url)) return;
+      try {
+        const url =
+          (response && response.url) ||
+          (typeof args[0] === "string" ? args[0] : args[0] && args[0].url) ||
+          "";
+        if (!isInterestingUrl(url)) return response;
 
-            const requestVars = parseRequestVars(
-              args[1] && args[1].body ? args[1].body : undefined
-            );
+        const requestVars = parseRequestVars(
+          args[1] && args[1].body ? args[1].body : undefined
+        );
 
-            response
-              .clone()
-              .text()
-              .then((text) => handleResponseBody(text, url, requestVars))
-              .catch(() => {
-                /* clone read failed — ignore, page unaffected */
-              });
-          } catch {
-            /* never disrupt the page */
-          }
-        })
-        .catch(() => {
-          /* the page's own fetch rejected — not our concern */
+        // Read the body from a CLONE so the original stream remains intact as
+        // our fail-open fallback.
+        let text;
+        try {
+          text = await response.clone().text();
+        } catch {
+          return response; // couldn't read → leave untouched
+        }
+
+        // Filtering OFF → observe + feed the panel, return the original.
+        if (currentRadiusKm == null) {
+          handleResponseBody(text, url, requestVars);
+          return response;
+        }
+
+        // Filtering ON → rewrite, bounded by an overall timeout so a stalled
+        // geocode can never freeze the page. null = leave original untouched.
+        const newBody = await withTimeout(
+          filterBody(text, url, requestVars),
+          FILTER_TIMEOUT_MS,
+          null
+        );
+        if (newBody == null) return response;
+
+        return new Response(newBody, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
         });
-
-      return promise; // ← original promise, untouched
+      } catch (err) {
+        // Anything unexpected → original response, page unaffected.
+        try {
+          console.warn(TAG, "fetch rewrite error (ignored):", err);
+        } catch {
+          /* ignore */
+        }
+        return response;
+      }
     };
     // Preserve identity hints some code checks for.
     try {
@@ -573,7 +902,7 @@
     } catch {
       /* ignore */
     }
-    console.debug(TAG, "fetch hook installed.");
+    console.debug(TAG, "fetch hook installed (active filtering).");
   }
 
   /* ==========================================================================
