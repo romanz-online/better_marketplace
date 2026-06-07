@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Marketplace Lens",
+  "version": "1.0.0",
+  "description": "Personal browsing aid for Facebook Marketplace. Surfaces where your search is targeting vs. where results actually come from, read from Facebook's own intercepted data layer (no scraping). To show how far each result is, it sends result city names (not your data) to a geocoding service.",
+
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://www.facebook.com/*",
+    "https://nominatim.openstreetmap.org/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "content_scripts": [
+    {
+      "//": "MAIN-world hook. Runs IN the page's own JS context so it can see Facebook's fetch/XHR. Must load at document_start, before Facebook makes its first GraphQL call.",
+      "matches": ["https://www.facebook.com/marketplace/*"],
+      "js": ["hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "//": "Isolated-world UI owner. Receives postMessage data from hook.js and renders the panel.",
+      "matches": ["https://www.facebook.com/marketplace/*"],
+      "js": ["content.js"],
+      "css": ["panel.css"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ]
+}
