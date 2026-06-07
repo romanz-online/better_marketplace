@@ -23,9 +23,9 @@
       "world": "MAIN"
     },
     {
-      "//": "Isolated-world UI owner. Receives postMessage data from hook.js and renders the panel.",
+      "//": "Isolated-world UI owner. cities-data.js (bundled offline US city→coords table) loads first so content.js can geocode locally without the network. Receives postMessage data from hook.js and renders the panel.",
       "matches": ["https://www.facebook.com/marketplace/*"],
-      "js": ["content.js"],
+      "js": ["cities-data.js", "content.js"],
       "css": ["panel.css"],
       "run_at": "document_idle",
       "world": "ISOLATED"

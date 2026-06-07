@@ -140,6 +140,11 @@
   font-weight: 500;
 }
 
+/* Hide listing cards filtered out by radius (applied to FB's own card cell). */
+.ml-hidden {
+  display: none !important;
+}
+
 /* ----- Radius control ----- */
 .ml-radius-row {
   display: flex;

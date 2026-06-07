@@ -70,27 +70,6 @@
     }
   }
 
-  // Push the active filtering config to hook.js (MAIN world). radiusKm null =
-  // filtering off. Called on init and whenever the radius changes, and in reply
-  // to the hook's ML_CONFIG_REQ (it may have loaded before us).
-  function pushConfigToPage() {
-    try {
-      const radiusKm =
-        CONFIG.radiusMiles != null ? CONFIG.radiusMiles * MILES_TO_KM : null;
-      window.postMessage(
-        {
-          __marketplaceLens: true,
-          type: "ML_CONFIG",
-          radiusKm,
-          bufferKm: CONFIG.bufferKm,
-        },
-        window.location.origin
-      );
-    } catch {
-      /* ignore */
-    }
-  }
-
   /* ==========================================================================
    * STATE
    * ========================================================================*/
@@ -104,7 +83,7 @@
     collapsed: CONFIG.startCollapsed,
     emptyResponseStreak: 0, // consecutive messages with 0 listings
     sawAnyListing: false,
-    filteredTotal: 0, // listings hidden from packets (out of radius), running sum
+    filteredTotal: 0, // count of distinct cards currently hidden (out of radius)
   };
 
   /* ==========================================================================
@@ -145,12 +124,108 @@
     return listing;
   }
 
-  // requestGeocode(name) — ask the background worker to resolve a city name to
-  // coordinates (once per unique name). Results land in state.cityCoords and
-  // trigger a re-render. Facebook gives us only a city, so this is the only way
-  // to compute a kilometre distance.
+  /* ==========================================================================
+   * LOCAL GEOCODER — instant, offline lookups from the bundled US city table
+   * (cities-data.js sets self.__ML_CITIES_TSV; loaded before this script).
+   * This removes the ~1 req/sec Nominatim bottleneck for the common case;
+   * Nominatim stays only as the fallback for cities not in the table.
+   * ========================================================================*/
+
+  // Normalize a city string. MUST match tools/gen-cities.js normalizeCity().
+  function normalizeCity(s) {
+    return String(s)
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, " ")
+      .replace(/^st\.?\s/, "saint ")
+      .replace(/^ft\.?\s/, "fort ")
+      .replace(/\./g, "");
+  }
+
+  // Full state name → USPS abbreviation (the dataset keys by 2-letter code).
+  const STATE_ABBR = {
+    alabama: "al", alaska: "ak", arizona: "az", arkansas: "ar",
+    california: "ca", colorado: "co", connecticut: "ct", delaware: "de",
+    "district of columbia": "dc", florida: "fl", georgia: "ga", hawaii: "hi",
+    idaho: "id", illinois: "il", indiana: "in", iowa: "ia", kansas: "ks",
+    kentucky: "ky", louisiana: "la", maine: "me", maryland: "md",
+    massachusetts: "ma", michigan: "mi", minnesota: "mn", mississippi: "ms",
+    missouri: "mo", montana: "mt", nebraska: "ne", nevada: "nv",
+    "new hampshire": "nh", "new jersey": "nj", "new mexico": "nm",
+    "new york": "ny", "north carolina": "nc", "north dakota": "nd", ohio: "oh",
+    oklahoma: "ok", oregon: "or", pennsylvania: "pa", "rhode island": "ri",
+    "south carolina": "sc", "south dakota": "sd", tennessee: "tn", texas: "tx",
+    utah: "ut", vermont: "vt", virginia: "va", washington: "wa",
+    "west virginia": "wv", wisconsin: "wi", wyoming: "wy",
+    "puerto rico": "pr",
+  };
+
+  // Lazily build "city|st" -> { lat, lng } from the bundled string, once.
+  let cityMap = null;
+  function getCityMap() {
+    if (cityMap) return cityMap;
+    cityMap = new Map();
+    try {
+      const tsv = self.__ML_CITIES_TSV;
+      if (typeof tsv === "string") {
+        for (const line of tsv.split("\n")) {
+          // city|st|lat|lng — city already normalized at generation time.
+          const i1 = line.indexOf("|");
+          const i2 = line.indexOf("|", i1 + 1);
+          const i3 = line.indexOf("|", i2 + 1);
+          if (i1 < 0 || i2 < 0 || i3 < 0) continue;
+          const key = line.slice(0, i2); // "city|st"
+          const lat = Number(line.slice(i2 + 1, i3));
+          const lng = Number(line.slice(i3 + 1));
+          if (Number.isFinite(lat) && Number.isFinite(lng)) {
+            cityMap.set(key, { lat, lng });
+          }
+        }
+      }
+      console.debug(TAG, `city table loaded: ${cityMap.size} entries.`);
+    } catch (err) {
+      console.warn(TAG, "city table load failed (ignored):", err);
+    }
+    return cityMap;
+  }
+
+  // Resolve "City, ST" / "City, State Name" to coords from the local table, or
+  // undefined if not present. Synchronous; no network.
+  function localGeocode(name) {
+    if (!name || typeof name !== "string") return undefined;
+    const comma = name.lastIndexOf(",");
+    if (comma < 0) return undefined; // need a state to disambiguate
+    const city = normalizeCity(name.slice(0, comma));
+    let region = name.slice(comma + 1).trim().toLowerCase().replace(/\./g, "");
+    if (region.length !== 2) region = STATE_ABBR[region] || region;
+    if (!/^[a-z]{2}$/.test(region) || !city) return undefined;
+
+    const map = getCityMap();
+    return (
+      map.get(city + "|" + region) ||
+      // Retry toggling a trailing " city" (e.g. FB "New York" ↔ "New York City").
+      (city.endsWith(" city")
+        ? map.get(city.slice(0, -5) + "|" + region)
+        : map.get(city + " city|" + region)) ||
+      undefined
+    );
+  }
+
+  // requestGeocode(name) — resolve a city name to coordinates (once per unique
+  // name). Tries the bundled offline table FIRST (instant); only falls back to
+  // the background worker / Nominatim for cities not in the table. Results land
+  // in state.cityCoords and trigger a re-render.
   function requestGeocode(name) {
     if (!name || state.geocodeRequested.has(name)) return;
+
+    // Fast path: offline table — synchronous, no network, no messaging.
+    const local = localGeocode(name);
+    if (local) {
+      state.geocodeRequested.add(name);
+      state.cityCoords.set(name, local);
+      return;
+    }
+
     state.geocodeRequested.add(name);
     state.cityCoords.set(name, null); // mark pending (null) until a reply lands
     try {
@@ -174,62 +249,123 @@
   }
 
   /* ==========================================================================
-   * BRIDGE for hook.js (MAIN world) — it can't call chrome.runtime, so it asks
-   * us to (a) relay city→coords geocode requests to the background worker, and
-   * (b) hand it the current filtering config. Only same-window, namespaced
-   * messages are trusted.
+   * DOM FILTERING — hide listing cards outside radius + buffer.
+   * --------------------------------------------------------------------------
+   * Facebook only gives us a CITY per listing, which we geocode (async, via the
+   * background worker) and compare to the search center. We let FB render
+   * normally, then hide far cards; cards whose city isn't geocoded yet stay
+   * visible until it resolves (fail-open), then get hidden if out of range.
    * ========================================================================*/
-  window.addEventListener("message", (event) => {
-    if (event.source !== window) return;
-    const data = event.data;
-    if (!data || data.__marketplaceLens !== true) return;
+  const ITEM_LINK_SELECTOR = 'a[href*="/marketplace/item/"]';
+  const HIDDEN_CLASS = "ml-hidden";
 
-    if (data.type === "ML_GEOCODE_REQ") {
-      const reqId = data.reqId;
-      const reply = (ok, lat, lng) => {
-        try {
-          window.postMessage(
-            { __marketplaceLens: true, type: "ML_GEOCODE_RES", reqId, ok, lat, lng },
-            window.location.origin
-          );
-        } catch {
-          /* ignore */
-        }
-      };
-      try {
-        chrome.runtime.sendMessage({ type: "ML_GEOCODE", q: data.q }, (resp) => {
-          if (chrome.runtime.lastError || !resp || resp.lat == null || resp.lng == null) {
-            reply(false);
-          } else {
-            reply(true, resp.lat, resp.lng);
-          }
-        });
-      } catch {
-        reply(false);
-      }
-    } else if (data.type === "ML_CONFIG_REQ") {
-      // Hook started up and wants the current config.
-      pushConfigToPage();
+  // Active radius limit in km (radius + buffer), or null when filtering is off.
+  function radiusLimitKm() {
+    if (CONFIG.radiusMiles == null) return null;
+    return CONFIG.radiusMiles * MILES_TO_KM + CONFIG.bufferKm;
+  }
+
+  // Decide whether a city is out of range. Returns true only when we KNOW the
+  // distance and it exceeds the limit (fail-open on unknown / pending).
+  function cityOutOfRange(name, limit) {
+    if (limit == null || !name) return false;
+    const dist = cityDistanceKm(name); // undefined if center/coords unknown
+    return dist != null && dist > limit;
+  }
+
+  // Resolve a card's city: prefer the hook's normalized data (by id), else read
+  // it off the card itself so filtering works even before/without hook data.
+  function cityForAnchor(anchor, id) {
+    const listing = id ? state.listingsById.get(id) : undefined;
+    if (listing && listing.locationName) return listing.locationName;
+
+    // Fallback 1: parse "…, <City, ST>, listing <id>" from the aria-label.
+    const label = anchor.getAttribute("aria-label") || "";
+    const m = label.match(/,\s*([^,]+,\s*[A-Z]{2}),\s*listing\s+\d+\s*$/);
+    if (m) return m[1].trim();
+
+    // Fallback 2: the city is the last short text span inside the card.
+    return undefined;
+  }
+
+  // Climb from the item anchor to the single card cell: the highest ancestor
+  // whose parent still contains exactly ONE item link (the parent that holds
+  // more than one is the results grid). Structure-based — no FB class names.
+  function findCard(anchor) {
+    let el = anchor;
+    for (let hops = 0; hops < 15; hops++) {
+      const p = el.parentElement;
+      if (!p || p === document.body) break;
+      if (p.querySelectorAll(ITEM_LINK_SELECTOR).length > 1) break; // p is the grid
+      el = p;
     }
-  });
+    return el;
+  }
 
-  // STUB: setupDomObserver()
-  // This is the clearly-labeled place where, later, we will match filtered
-  // data back to the DOM cards Facebook already painted and hide/reorder them.
-  // v1 OBSERVES ONLY and takes NO action on the DOM.
+  // Apply (or clear) hiding across all currently-rendered listing cards.
+  function applyDomFilter() {
+    try {
+      const limit = radiusLimitKm();
+
+      // Filtering off → un-hide everything we previously hid.
+      if (limit == null) {
+        document
+          .querySelectorAll("." + HIDDEN_CLASS)
+          .forEach((el) => el.classList.remove(HIDDEN_CLASS));
+        if (state.filteredTotal !== 0) {
+          state.filteredTotal = 0;
+          renderFilterStatus();
+        }
+        return;
+      }
+
+      const hiddenIds = new Set();
+      const anchors = document.querySelectorAll(ITEM_LINK_SELECTOR);
+      for (const anchor of anchors) {
+        const href = anchor.getAttribute("href") || "";
+        const idMatch = href.match(/\/marketplace\/item\/(\d+)/);
+        const id = idMatch ? idMatch[1] : undefined;
+
+        const city = cityForAnchor(anchor, id);
+        if (city) requestGeocode(city); // ensure coords are (being) resolved
+
+        const card = findCard(anchor);
+        if (cityOutOfRange(city, limit)) {
+          card.classList.add(HIDDEN_CLASS);
+          if (id) hiddenIds.add(id);
+        } else {
+          card.classList.remove(HIDDEN_CLASS);
+        }
+      }
+
+      if (state.filteredTotal !== hiddenIds.size) {
+        state.filteredTotal = hiddenIds.size;
+        renderFilterStatus();
+      }
+    } catch (err) {
+      console.warn(TAG, "applyDomFilter failed (ignored):", err);
+    }
+  }
+
+  // Watch the (virtualized) results grid; cards mount/unmount on scroll, so we
+  // re-apply on every (debounced) mutation. Also re-applied from render() when
+  // a geocode resolves, and immediately on radius change.
   let domObserver = null;
+  let domFilterTimer = null;
+  function scheduleDomFilter() {
+    if (domFilterTimer != null) return;
+    domFilterTimer = setTimeout(() => {
+      domFilterTimer = null;
+      applyDomFilter();
+    }, 150);
+  }
   function setupDomObserver() {
     try {
       if (domObserver) return;
-      domObserver = new MutationObserver(() => {
-        // TODO: when DOM filtering is implemented:
-        //   1. Locate the results grid container.
-        //   2. For each card, resolve its listing id (from its item URL/href).
-        //   3. Cross-reference applyFilters() output; hide or reorder cards.
-        // Intentionally a no-op in v1.
-      });
+      domObserver = new MutationObserver(scheduleDomFilter);
       domObserver.observe(document.body, { childList: true, subtree: true });
-      console.debug(TAG, "DOM observer wired (no-op in v1).");
+      applyDomFilter(); // initial pass over whatever is already painted
+      console.debug(TAG, "DOM filter observer wired.");
     } catch (err) {
       console.warn(TAG, "setupDomObserver failed (ignored):", err);
     }
@@ -284,10 +420,6 @@
     try {
       if (data.searchContext) {
         state.searchContext = data.searchContext;
-      }
-
-      if (typeof data.filteredCount === "number" && data.filteredCount > 0) {
-        state.filteredTotal += data.filteredCount;
       }
 
       const added = ingestListings(data.listings);
@@ -350,7 +482,7 @@
       '<div class="ml-search-value"></div>';
 
     // Section: Radius control — the user's TRUE radius (FB's packet radius is
-    // unreliable). Empty = filtering off. Drives packet-level filtering in hook.js.
+    // unreliable). Empty = filtering off. Drives DOM filtering (applyDomFilter).
     const radiusSection = document.createElement("section");
     radiusSection.className = "ml-section ml-section--radius";
     radiusSection.innerHTML =
@@ -373,8 +505,8 @@
         CONFIG.radiusMiles = Number(v);
       }
       saveConfig();
-      pushConfigToPage();
       render();
+      applyDomFilter(); // re-evaluate cards immediately with the new radius
     };
     radiusInput.addEventListener("change", onRadiusChange);
     radiusInput.addEventListener("keydown", (e) => {
@@ -607,6 +739,9 @@
     renderSearchContext();
     renderFilterStatus();
     renderResults();
+    // A geocode may have just resolved (render() is the geocode callback path),
+    // so re-evaluate which cards should be hidden.
+    scheduleDomFilter();
   }
 
   /* ==========================================================================
@@ -619,12 +754,11 @@
       return;
     }
     // Load persisted settings BEFORE building the panel so the radius input is
-    // pre-filled, then push the config to the hook (MAIN world).
+    // pre-filled, then start watching the DOM for cards to filter.
     loadConfig(() => {
       buildPanel();
       render();
-      pushConfigToPage();
-      setupDomObserver(); // no-op observer (stub) in v1
+      setupDomObserver();
       console.debug(TAG, "content.js UI ready.");
     });
   }
